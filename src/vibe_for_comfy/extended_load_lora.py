@@ -12,6 +12,7 @@ from .constants import NODE_CATEGORY
 import comfy.sd
 import comfy.lora
 from nodes import LoraLoader
+import os
 
 class ExtendedLoadLoRA:
     """
@@ -60,24 +61,20 @@ class ExtendedLoadLoRA:
                     "display": "Notes", 
                     "multiline": True
                 }),
-                "model_description": ("STRING", {
-                    "forceInput": True,
-                    "display": "Model Description",
-                    "multiline": True
-                }),
             },
             "optional": {
                 "prompt": ("STRING", {
                     "forceInput": True, 
                     "multiline": True
                 }),
+                "loaded_lora_names_list": ("CUSTOM_LORA_LIST", {"forceInput": True}),
             }
         }
 
         return input_types
 
-    RETURN_TYPES: Tuple[str, str, str] = ("MODEL", "STRING", "STRING")
-    RETURN_NAMES: Tuple[str, str, str] = ("model", "model_description", "prompt")
+    RETURN_TYPES: Tuple[str, str, str, str] = ("MODEL", "STRING", "CUSTOM_LORA_LIST")
+    RETURN_NAMES: Tuple[str, str, str, str] = ("model", "prompt", "lora_list")
     DESCRIPTION: str = cleandoc(__doc__)
     FUNCTION: str = "exec"
     CATEGORY: str = NODE_CATEGORY
@@ -89,24 +86,9 @@ class ExtendedLoadLoRA:
         strength_model: float, 
         prompt_to_append: str, 
         notes: str,
-        model_description: str,
-        prompt: str = ""
-    ) -> Tuple[Any, str, str]:
-        """
-        Execute the LoRA loading and prompt enhancement.
-        
-        Args:
-            model: The base model to apply LoRA to
-            lora_name: Name of the LoRA file to load
-            strength_model: Strength multiplier for the LoRA
-            prompt: Existing prompt to combine with
-            prompt_to_append: Additional prompt text to append
-            notes: Notes about the LoRA application
-            model_description: Current model description
-            
-        Returns:
-            Tuple containing (modified_model, updated_model_description, enhanced_prompt)
-        """
+        prompt: str = "",
+        loaded_lora_names_list: List[str] = []
+    ) -> Tuple[Any, str, str, str]:
         
         model_with_lora, _ = LoraLoader().load_lora(model, None, lora_name, strength_model, None)
         
@@ -117,14 +99,9 @@ class ExtendedLoadLoRA:
         if prompt_to_append:
             prompt_parts.append(prompt_to_append)
         
-        enhanced_prompt = ", ".join(prompt_parts) if prompt_parts else ""
+        enhanced_prompt = "\n".join(prompt_parts) if prompt_parts else ""
         
-        # Update model description
-        lora_info = f"LoRA: {lora_name} (strength: {strength_model})"
+        # Update lora list - work with list of strings
+        new_lora_entry = f"{lora_name}:{strength_model}"            
         
-        if model_description:
-            updated_description = f"{model_description}\n{lora_info}"
-        else:
-            updated_description = lora_info
-        
-        return (model_with_lora, updated_description, enhanced_prompt)
+        return (model_with_lora, enhanced_prompt, loaded_lora_names_list + [new_lora_entry])

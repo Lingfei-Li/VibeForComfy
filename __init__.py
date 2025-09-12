@@ -18,10 +18,16 @@ from .src.vibe_for_comfy.constants import (
 # Import node classes
 from .src.vibe_for_comfy.nodes import StringListJoiner
 from .src.vibe_for_comfy.open_folders import OpenFolders
+from .src.vibe_for_comfy.open_file_explorer import OpenInFileExplorer
 from .src.vibe_for_comfy.extended_load_lora import ExtendedLoadLoRA
 from .src.vibe_for_comfy.workflow_snapshot import WorkflowSnapshot
 from .src.vibe_for_comfy.extended_ksampler import ExtendedKSampler
-from .src.vibe_for_comfy.extended_save_image import ExtendedSaveImage
+from .src.vibe_for_comfy.extended_save_image import (
+    ExtendedSaveImage,
+    ImageMetadataReader,
+    SDParameterGenerator,
+    SDTypeConverter,
+)
 from .src.vibe_for_comfy.extended_load_checkpoint import ExtendedLoadCheckpoint
 
 # Import and register routes
@@ -43,10 +49,14 @@ NODE_CLASS_MAPPINGS: Dict[str, Type[Any]] = {
     "ExtendedLoadLoRA": ExtendedLoadLoRA,
     "StringListJoiner": StringListJoiner,
     "OpenFolders": OpenFolders,
+    "OpenInFileExplorer": OpenInFileExplorer,
     "WorkflowSnapshot": WorkflowSnapshot,
     "ExtendedKSampler": ExtendedKSampler,
     "ExtendedSaveImage": ExtendedSaveImage,
     "ExtendedLoadCheckpoint": ExtendedLoadCheckpoint,
+    "ImageMetadataReader": ImageMetadataReader,
+    "SDParameterGenerator": SDParameterGenerator,
+    "SDTypeConverter": SDTypeConverter,
 }
 
 # Human-readable display names for the nodes
@@ -57,7 +67,11 @@ NODE_DISPLAY_NAME_MAPPINGS: Dict[str, str] = {
     "ExtendedLoadCheckpoint": "Extended Load Checkpoint",
     "StringListJoiner": "String List Joiner", 
     "OpenFolders": "Open Folders",
+    "OpenInFileExplorer": "Open In File Explorer",
     "WorkflowSnapshot": "Workflow Snapshot",
+    "ImageMetadataReader": "Image Metadata Reader",
+    "SDParameterGenerator": "SD Parameter Generator",
+    "SDTypeConverter": "SD Type Converter",
 }
 
 # Register backend routes

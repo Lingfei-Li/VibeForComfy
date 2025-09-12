@@ -33,6 +33,7 @@ Outputs:
 from inspect import cleandoc
 from typing import Any, Dict, Tuple
 from .constants import NODE_CATEGORY
+import comfy.samplers
 
 
 try:
@@ -80,22 +81,15 @@ class ExtendedKSampler:
 
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
-        sampler_names = [
-            "euler", "euler_a", "dpm++_2m", "dpm++_sde", "heun", "lms"
-        ]
-        schedulers = [
-            "normal", "karras", "exponential", "polyexponential"
-        ]
 
         return {
             "required": {
                 "model": ("MODEL", {"forceInput": True}),
-                "model_description": ("STRING", {"multiline": True, "forceInput": True, "default": ""}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
                 "steps": ("INT", {"default": 25, "min": 1, "max": 200, "step": 1}),
                 "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 30.0, "step": 0.5}),
-                "sampler_name": (sampler_names, {"default": sampler_names[0]}),
-                "scheduler": (schedulers, {"default": schedulers[0]}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
                 "clip": ("CLIP", {"forceInput": True}),
                 "latent": ("LATENT", {"forceInput": True}),
                 "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
@@ -105,8 +99,8 @@ class ExtendedKSampler:
             }
         }
 
-    RETURN_TYPES: Tuple[str, ...] = ("IMAGE", "STRING", "STRING", "INT", "FLOAT", "STRING", "STRING", "MODEL", "STRING")
-    RETURN_NAMES: Tuple[str, ...] = ("image", "positive_prompt", "negative_prompt", "steps", "cfg", "sampler_name", "scheduler", "model", "model_description")
+    RETURN_TYPES: Tuple[str, ...] = ("IMAGE",)
+    RETURN_NAMES: Tuple[str, ...] = ("image",)
     DESCRIPTION: str = cleandoc(__doc__)
     FUNCTION: str = "run"
     CATEGORY: str = NODE_CATEGORY
@@ -125,8 +119,7 @@ class ExtendedKSampler:
         vae: Any,
         positive_prompt: str,
         negative_prompt: str,
-        model_description: str,
-    ) -> Tuple[Any, str, str, int, float, str, str, Any, str]:
+    ) -> Tuple[Any]:
         if common_ksampler is None or VAEDecode is None or CLIPTextEncode is None:
             raise RuntimeError("ComfyUI core nodes module is not available: required imports failed")
 
@@ -162,16 +155,6 @@ class ExtendedKSampler:
         decoded_image_tuple = decoder.decode(vae, samples)
         decoded_image = decoded_image_tuple[0] if isinstance(decoded_image_tuple, tuple) else decoded_image_tuple
 
-        return (
-            decoded_image,
-            positive_prompt,
-            negative_prompt,
-            steps,
-            cfg,
-            sampler_name,
-            scheduler,
-            model,
-            model_description,
-        )
+        return (decoded_image,)
 
 

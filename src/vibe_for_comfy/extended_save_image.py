@@ -1,264 +1,953 @@
-"""
-ExtendedSaveImage node: custom save that enforces a forced image input and a
-string filename prefix, embeds metadata, and writes PNGs to the output folder.
 
-Inputs:
-- image: IMAGE (forceInput)
-- filename_prefix: STRING
-- positive_prompt: STRING (multiline)
-- negative_prompt: STRING (multiline)
-- steps: INT
-- cfg: FLOAT
-- sampler_name: STRING
-- scheduler: STRING
-- model_description: STRING (multiline)
+from datetime import datetime
+from itertools import chain
 
-Outputs:
-- metadata: STRING - Formatted metadata as a string
-
-Behavior:
-- Computes the next sequence number for files with the given prefix in the
-  output directory and generates filenames like: <prefix>_<seq>.png
-- Embeds provided fields as PNG metadata and saves images in PNG format.
-- Creates sidecar Markdown files with metadata for each saved image.
-- Returns the metadata as a formatted string output.
-"""
-
-from inspect import cleandoc
-from typing import Any, Dict
-import os
+import torch
+import json
 import re
+import os
+import numpy as np
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
-from PIL import Image  # type: ignore
-from PIL.PngImagePlugin import PngInfo  # type: ignore
+import hashlib
+import piexif
+import piexif.helper
 
-from .constants import NODE_CATEGORY, FOLDER_MAP
-from nodes import SaveImage
+from nodes import MAX_RESOLUTION
+from comfy.cli_args import args
+import comfy.samplers
+import comfy.sd
+import comfy.utils
+import folder_paths
+from typing import List
 
-
-try:  # Optional, for tensor conversions
-    import torch  # type: ignore
-except Exception:  # pragma: no cover
-    torch = None  # type: ignore
-try:
-    import numpy as np  # type: ignore
-except Exception:  # pragma: no cover
-    np = None  # type: ignore
-
+SUPPORTED_FORMATS = ["png", "jpg", "jpeg", "webp"]
 
 class ExtendedSaveImage:
-    """
-    ExtendedLoadLoRA Node: Output node that saves provided images using ComfyUI's core SaveImage logic.
+    model_hash_dict = {}
+    lora_hash_dict = {}
+    ti_hash_dict = {}
+    ti_paths = []
+    ti_names = []
+    ti_stems = []
 
-    This node simply enforces an image input and forwards the call to the
-    upstream implementation for consistent file naming and output directory usage.
-    """
-
-    def __init__(self) -> None:
-        pass
-
-
-    # This node produces a metadata string output
-    RETURN_TYPES: tuple = ("STRING",)
-    RETURN_NAMES: tuple = ("metadata",)
-    OUTPUT_NODE: bool = False
-    DESCRIPTION: str = cleandoc(__doc__)
-    FUNCTION: str = "save"
-    CATEGORY: str = NODE_CATEGORY
+    def __init__(self):
+        self.output_dir = folder_paths.get_output_directory()
+        self.type = "output"
+        self.prefix_append = ""
 
     @classmethod
-    def IS_CHANGED(cls, **kwargs: Any) -> str:
-        # Force re-run when inputs change by returning a string representation
-        return str(hash(tuple(sorted(kwargs.items()))))
-
-    @classmethod
-    def INPUT_TYPES(cls) -> Dict[str, Dict[str, Any]]:
+    def INPUT_TYPES(s):
+        for file in folder_paths.get_filename_list("embeddings"):
+            ExtendedSaveImage.ti_paths.append(file)
+            ExtendedSaveImage.ti_names.append(Path(file).name)
+            ExtendedSaveImage.ti_stems.append(Path(file).stem)
         return {
             "required": {
-                "image": ("IMAGE", {"forceInput": True}),
-                "filename_prefix": ("STRING", {"default": ""}),
-                "positive_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
-                "negative_prompt": ("STRING", {"forceInput": True, "multiline": True, "default": ""}),
-                "steps": ("INT", {"forceInput": True, "default": 20, "min": 1, "max": 10000, "step": 1}),
-                "cfg": ("FLOAT", {"forceInput": True, "default": 7.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "sampler_name": ("STRING", {"forceInput": True, "default": "euler"}),
-                "scheduler": ("STRING", {"forceInput": True, "default": "normal"}),
-                "model_description": ("STRING", {"multiline": True, "forceInput": True, "default": ""}),
-            }
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "filename": (
+                    "STRING",
+                    {"default": "ComfyUI_%time_%seed_%counter", "multiline": False},
+                ),
+                "path": ("STRING", {"default": "%date/", "multiline": False}),
+                "model_name": (folder_paths.get_filename_list("checkpoints"),),
+                # "model_name_str": ("STRING", {"default": ""}),
+                "seed": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0xFFFFFFFFFFFFFFFF,
+                    },
+                ),
+                "steps": (
+                    "INT",
+                    {"default": 20, "min": 1, "max": 10000},
+                ),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.5,
+                        "round": 0.01,
+                    },
+                ),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "loaded_lora_names_list": ("CUSTOM_LORA_LIST", {"forceInput": True}),
+                "width": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": MAX_RESOLUTION, "step": 1},
+                ),
+                "height": (
+                    "INT",
+                    {"default": 1, "min": 1, "max": MAX_RESOLUTION, "step": 1},
+                ),
+                "positive": ("STRING", {"default": "", "multiline": True}),
+                "negative": ("STRING", {"default": "", "multiline": True}),
+                "extension": (SUPPORTED_FORMATS,),
+                "calculate_hash": ("BOOLEAN", {"default": True}),
+                "resource_hash": ("BOOLEAN", {"default": True}),
+                "lossless_webp": ("BOOLEAN", {"default": True}),
+                "jpg_webp_quality": ("INT", {"default": 100, "min": 1, "max": 100}),
+                "date_format": (
+                    "STRING",
+                    {"default": "%Y-%m-%d", "multiline": False},
+                ),
+                "time_format": (
+                    "STRING",
+                    {"default": "%H%M%S", "multiline": False},
+                ),
+                "save_metadata_file": ("BOOLEAN", {"default": False}),
+                "extra_info": ("STRING", {"default": "", "multiline": True}),
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
 
-    def _to_pil_list(self, image: Any) -> List[Image.Image]:
-        # Handle batch of images in common Comfy formats
-        if isinstance(image, Image.Image):
-            return [image]
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("FILENAME", "FILE_PATH", "METADATA")
+    FUNCTION = "save_images"
 
-        # If list/tuple of PIL
-        if isinstance(image, (list, tuple)) and len(image) > 0 and isinstance(image[0], Image.Image):
-            return list(image)
+    OUTPUT_NODE = True
 
-        # If dict-like with 'images'
-        if isinstance(image, dict) and "images" in image:
-            return self._to_pil_list(image["images"])  # type: ignore[index]
+    CATEGORY = "SD Prompt Reader"
 
-        # If torch tensor [B,H,W,C] float 0..1
-        if torch is not None and isinstance(image, torch.Tensor):  # type: ignore[attr-defined]
-            tensor = image
-            if tensor.ndim == 3:
-                tensor = tensor.unsqueeze(0)
-            pil_images: List[Image.Image] = []
-            for t in tensor:  # type: ignore[assignment]
-                arr = t
-                if arr.ndim == 3 and arr.shape[-1] in (1, 3, 4):
-                    arr = arr.detach().cpu().clamp(0, 1)
-                    arr = (arr * 255.0).round().byte().numpy()
-                    if arr.shape[-1] == 1:
-                        arr = arr[:, :, 0]
-                    pil_images.append(Image.fromarray(arr))
-            if pil_images:
-                return pil_images
-
-        # If numpy array [B,H,W,C]
-        if np is not None and isinstance(image, np.ndarray):  # type: ignore[attr-defined]
-            array = image
-            if array.ndim == 3:
-                array = np.expand_dims(array, 0)
-            pil_images: List[Image.Image] = []
-            for arr in array:
-                arr = np.clip(arr, 0.0, 1.0)
-                arr = (arr * 255.0).round().astype("uint8")
-                if arr.shape[-1] == 1:
-                    arr = arr[:, :, 0]
-                pil_images.append(Image.fromarray(arr))
-            if pil_images:
-                return pil_images
-
-        # Unknown format
-        raise TypeError("Unsupported image format for saving")
-
-    def _next_sequence_number(self, directory: Path, prefix: str) -> int:
-        # Try to find the highest numeric suffix among files that start with prefix_
-        # and end with .png, capturing the last digit group before the extension.
-        pattern = re.compile(rf"^{re.escape(prefix)}_(?:.*?)(\d+)\.png$", re.IGNORECASE)
-        max_n = 0
-        if directory.exists():
-            for name in os.listdir(directory):
-                if not (name.lower().startswith(f"{prefix.lower()}_") and name.lower().endswith(".png")):
-                    continue
-                m = pattern.match(name)
-                if m:
-                    try:
-                        n = int(m.group(1))
-                        if n > max_n:
-                            max_n = n
-                    except ValueError:
-                        continue
-        # Start from max+1, but ensure we pick a filename that does not exist (robust to non-matching patterns)
-        candidate = max_n + 1
-        while (directory / f"{prefix}_{candidate:05d}.png").exists():
-            candidate += 1
-        return candidate
-
-    def _build_pnginfo(self, metadata: Dict[str, Any]) -> PngInfo:
-        info = PngInfo()
-        for k, v in metadata.items():
-            info.add_text(k, str(v))
-        return info
-
-    def _format_metadata_as_markdown(self, metadata: Dict[str, Any]) -> str:
-        """Format metadata dictionary as Markdown."""
-        lines = ["# Image Metadata", ""]
-        
-        for key, value in metadata.items():
-            # Convert key to title case and replace underscores with spaces
-            title = key.replace("_", " ").title()
-            lines.append(f"## {title}")
-            lines.append("")
-            
-            # Handle multiline strings (like prompts)
-            if isinstance(value, str) and "\n" in value:
-                lines.append("```")
-                lines.append(value)
-                lines.append("```")
-            else:
-                lines.append(str(value))
-            
-            lines.append("")
-            lines.append("")  # Additional line break after each section
-        
-        return "\n".join(lines)
-
-    def _format_metadata_as_string(self, metadata: Dict[str, Any]) -> str:
-        """Format metadata dictionary as a readable string."""
-        lines = []
-        
-        for key, value in metadata.items():
-            # Convert key to title case and replace underscores with spaces
-            title = key.replace("_", " ").title()
-            lines.append(f"{title}: {value}")
-        
-        return "\n".join(lines)
-
-
-    def save(
+    def save_images(
         self,
-        image: Any,
-        filename_prefix: str = "",
-        positive_prompt: str = "",
-        negative_prompt: str = "",
-        steps: int = 20,
-        cfg: float = 7.0,
-        sampler_name: str = "euler",
-        scheduler: str = "normal",
-        model_description: str = "",
-    ) -> tuple:
-        output_dir = Path(FOLDER_MAP.get("outputs") or "./output").resolve()
-        output_dir.mkdir(parents=True, exist_ok=True)
+        images,
+        filename: str = "ComfyUI_%time_%seed_%counter",
+        path: str = "%date/",
+        model_name: str = "",
+        model_name_str: str = "",
+        seed: int = 0,
+        steps: int = 0,
+        cfg: float = 0.0,
+        sampler_name: str = "",
+        sampler_name_str: str = "",
+        scheduler: str = "",
+        scheduler_str: str = "",
+        loaded_lora_names_list: List[str] = [],
+        width: int = 1,
+        height: int = 1,
+        positive: str = "",
+        negative: str = "",
+        extension: str = "png",
+        calculate_hash: bool = True,
+        resource_hash: bool = True,
+        lossless_webp: bool = True,
+        jpg_webp_quality: int = 100,
+        date_format: str = "%Y-%m-%d",
+        time_format: str = "%H%M%S",
+        save_metadata_file: bool = False,
+        extra_info: str = "",
+        prompt=None,
+        extra_pnginfo=None,
+    ):
+        (
+            full_output_folder,
+            filename_alt,
+            counter_alt,
+            subfolder_alt,
+            filename_prefix,
+        ) = folder_paths.get_save_image_path(
+            self.prefix_append,
+            self.output_dir,
+            images[0].shape[1],
+            images[0].shape[0],
+        )
 
-        prefix = filename_prefix.strip() or "ComfyUI"
-        seq = self._next_sequence_number(output_dir, prefix)
+        results = []
+        files = []
+        comments = []
+        file_paths = []
+        for image in images:
+            # model_name_str, sampler_name_str, scheduler_str = None, None, None
 
-        pil_images = self._to_pil_list(image)
-        saved_paths: List[str] = []
+            model_name_real = model_name_str if model_name_str else model_name
+            sampler_name_real = sampler_name_str if sampler_name_str else sampler_name
+            scheduler_real = scheduler_str if scheduler_str else scheduler
+
+            extra_info_real = f", Extra info: {extra_info}" if extra_info else ""
+
+            variable_map = {
+                "%date": self.get_time(date_format),
+                "%time": self.get_time(time_format),
+                "%seed": seed,
+                "%steps": steps,
+                "%cfg": cfg,
+                "%width": width,
+                "%height": height,
+                "%extension": extension,
+                "%model": Path(model_name_real).stem,
+                "%sampler": sampler_name_real,
+                "%scheduler": scheduler_real,
+                "%quality": jpg_webp_quality,
+            }
+
+            subfolder = self.get_path(path, variable_map)
+            output_folder = Path(full_output_folder) / subfolder
+            output_folder.mkdir(parents=True, exist_ok=True)
+            counter = self.get_counter(output_folder)
+            variable_map["%counter"] = f"{counter:05}"
+
+            i = 255.0 * image.cpu().numpy()
+            img = Image.fromarray(np.clip(i, 0, 255).astype(np.uint8))
+            metadata = None
+
+            model_hash_str = ""
+            lora_hash_dict = {}
+            lora_hash_str = ""
+            ti_hash_dict = {}
+            ti_hash_str = ""
 
 
-        SaveImage().save_image(image, filename_prefix)
+            hashes = {}
+            if calculate_hash:
+                if model_name_real:
+                    model_hash = self.calculate_hash(model_name_real, "model")
+                    model_hash_str = f"Model hash: {model_hash}, "
+                    hashes["model"] = model_hash
 
-        # Shared metadata
-        meta = {
-            "model_description": model_description,
-            "positive_prompt": positive_prompt,
-            "negative_prompt": negative_prompt,
-            "steps": steps,
-            "cfg": cfg,
-            "sampler_name": sampler_name,
-            "scheduler": scheduler,
+                if loaded_lora_names_list:
+                    loaded_lora_names_list_unique = list(set(loaded_lora_names_list))
+                    for name in loaded_lora_names_list_unique:
+                        lora_hash = self.calculate_hash(name, "lora")
+                        lora_hash_dict[Path(name).stem] = lora_hash
+                        hashes[f"lora:{Path(name).stem}"] = lora_hash
+                    lora_hash_items = [f"{k}: {v}" for k, v in lora_hash_dict.items()]
+                    lora_hash_str_value = ", ".join(lora_hash_items)
+                    lora_hash_str = f'Lora hashes: "{lora_hash_str_value}", '
+
+                ti_pattern = (
+                    r"(?:\(|\s|,)?"  # match an optional opening parenthesis, space, or comma
+                    r"embedding:"  # match the literal text "embedding:"
+                    r"([^\s:,()]+)"  # match a string that does not contain spaces, colons, commas, or parentheses
+                    r"(?:\.(?:pt|safetensors))?"  # optionally match a file extension ".pt" or ".safetensors"
+                    r"(?::\d+(?:\.\d+)?)?"  # optionally match a colon followed by numbers,
+                    # with an optional decimal part (e.g., ":1" or ":1.0")
+                    r"(?:\)|,|\s)?"  # optionally match a closing parenthesis, comma, or space
+                )
+                ti_names = re.findall(ti_pattern, f"{positive}/n{negative}")
+                ti_names_with_ext = [self.search_ti(name) for name in ti_names]
+
+                for name in ti_names_with_ext:
+                    if name:
+                        ti_hash = self.calculate_hash(name, "ti")
+                        ti_hash_dict[Path(name).stem] = ti_hash
+                        hashes[f"embed:{Path(name).stem}"] = ti_hash
+                ti_hash_items = [f"{k}: {v}" for k, v in ti_hash_dict.items()]
+                ti_hash_str_value = ", ".join(ti_hash_items)
+                ti_hash_str = f'TI hashes: "{ti_hash_str_value}", '
+
+            hashes_str = (
+                f", Hashes: {json.dumps(hashes)}" if (hashes and resource_hash) else ""
+            )
+
+            comment = (
+                f"{positive}\n"
+                f"Negative prompt: {negative}\n"
+                f"Steps: {steps}, "
+                f"Sampler: {sampler_name_real}{''if scheduler_real == 'normal' else '_'+scheduler_real}, "
+                f"CFG scale: {cfg}, "
+                f"Seed: {seed}, "
+                f"Size: {img.width if width==0 else width}x{img.height if height==0 else height}, "
+                f"{model_hash_str}"
+                f"Model: {Path(model_name_real).stem}, "
+                f"{lora_hash_str}"
+                f"{ti_hash_str}"
+                f"Version: ComfyUI"
+                f"{hashes_str}"
+                f"{extra_info_real}"
+            )
+
+            stem = self.get_path(filename, variable_map)
+            file = self.get_unique_filename(stem, extension, output_folder)
+            file_path = output_folder / file
+
+            if extension == "png":
+                if not args.disable_metadata:
+                    metadata = PngInfo()
+                    metadata.add_text("parameters", comment)
+                    if prompt is not None:
+                        metadata.add_text("prompt", json.dumps(prompt))
+                    if extra_pnginfo is not None:
+                        for x in extra_pnginfo:
+                            metadata.add_text(x, json.dumps(extra_pnginfo[x]))
+                img.save(
+                    file_path,
+                    pnginfo=metadata,
+                    compress_level=4,
+                )
+            else:
+                img.save(
+                    file_path,
+                    quality=jpg_webp_quality,
+                    lossless=lossless_webp,
+                )
+                if not args.disable_metadata:
+                    metadata = piexif.dump(
+                        {
+                            "Exif": {
+                                piexif.ExifIFD.UserComment: piexif.helper.UserComment.dump(
+                                    comment, encoding="unicode"
+                                )
+                            },
+                        }
+                    )
+                    piexif.insert(metadata, str(file_path))
+
+            if save_metadata_file:
+                with open(file_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
+                    f.write(comment)
+
+            results.append(
+                {"filename": file.name, "subfolder": str(subfolder), "type": self.type}
+            )
+            files.append(str(file))
+            file_paths.append(str(file_path))
+            comments.append(comment)
+
+        return {
+            "ui": {"images": results},
+            "result": (
+                self.unpack_singleton(files),
+                self.unpack_singleton(file_paths),
+                self.unpack_singleton(comments),
+            ),
         }
-        pnginfo = self._build_pnginfo(meta)
 
-        for idx, im in enumerate(pil_images):
-            # Ensure uniqueness per image (check existence again in case of concurrent writes)
-            candidate = seq + idx
-            while (output_dir / f"{prefix}_{candidate:05d}.png").exists():
-                candidate += 1
-            filename = f"{prefix}_{candidate:05d}.png"
-            path = output_dir / filename
-            im.save(path, format="PNG", pnginfo=pnginfo)
-            saved_paths.append(str(path))
+    @staticmethod
+    def calculate_hash(name, hash_type):
+        match hash_type:
+            case "model":
+                hash_dict = ExtendedSaveImage.model_hash_dict
+                file_name = folder_paths.get_full_path("checkpoints", name)
+            case "lora":
+                hash_dict = ExtendedSaveImage.lora_hash_dict
+                file_name = folder_paths.get_full_path("loras", name)
+            case "ti":
+                hash_dict = ExtendedSaveImage.ti_hash_dict
+                file_name = folder_paths.get_full_path("embeddings", name)
+            case _:
+                return ""
 
-            # Write sidecar Markdown with the same base filename
-            md_path = path.with_suffix('.md')
-            try:
-                with md_path.open('w', encoding='utf-8') as f:
-                    markdown_content = self._format_metadata_as_markdown(meta)
-                    f.write(markdown_content)
-            except Exception:
-                # Best-effort; do not fail the node if Markdown writing fails
-                pass
+        if hash_value := hash_dict.get(name):
+            return hash_value
 
-        # Return the metadata as a formatted string
-        metadata_string = self._format_metadata_as_string(meta)
-        return (metadata_string,)
+        hash_sha256 = hashlib.sha256()
+        blksize = 1024 * 1024
 
+        with open(file_name, "rb") as f:
+            for chunk in iter(lambda: f.read(blksize), b""):
+                hash_sha256.update(chunk)
+
+        hash_value = hash_sha256.hexdigest()[:10]
+        hash_dict[name] = hash_value
+
+        return hash_value
+
+    @staticmethod
+    def get_counter(directory: Path):
+        img_files = list(
+            chain(*(directory.rglob(f"*{suffix}") for suffix in SUPPORTED_FORMATS))
+        )
+        return len(img_files) + 1
+
+    @staticmethod
+    def get_path(name, variable_map):
+        for variable, value in variable_map.items():
+            name = name.replace(variable, str(value))
+        return Path(name)
+
+    @staticmethod
+    def get_time(time_format):
+        now = datetime.now()
+        try:
+            time_str = now.strftime(time_format)
+            return time_str
+        except:
+            return ""
+
+    @staticmethod
+    def get_unique_filename(stem: Path, extension: str, output_folder: Path):
+        file = stem.with_suffix(f"{stem.suffix}.{extension}")
+        index = 0
+
+        while (output_folder / file).exists():
+            index += 1
+            new_stem = Path(f"{stem}_{index}")
+            file = new_stem.with_suffix(f"{new_stem.suffix}.{extension}")
+
+        return file
+
+    @staticmethod
+    def search_ti(ti: str):
+        if not ti or ti in ExtendedSaveImage.ti_paths:
+            return ti
+
+        if ti in ExtendedSaveImage.ti_stems:
+            return ExtendedSaveImage.ti_paths[ExtendedSaveImage.ti_stems.index(ti)]
+
+        if ti in ExtendedSaveImage.ti_names:
+            return ExtendedSaveImage.ti_paths[ExtendedSaveImage.ti_names.index(ti)]
+
+        return ""
+
+    @staticmethod
+    def unpack_singleton(arr: list):
+        return arr[0] if len(arr) == 1 else arr
+
+
+
+class ImageMetadataReader:
+    files = []
+    ckpt_paths = []
+    ckpt_names = []
+    ckpt_stems = []
+
+    @classmethod
+    def INPUT_TYPES(s):
+        for path in folder_paths.get_filename_list("checkpoints"):
+            ImageMetadataReader.ckpt_paths.append(path)
+            ImageMetadataReader.ckpt_names.append(Path(path).name)
+            ImageMetadataReader.ckpt_stems.append(Path(path).stem)
+
+        input_dir = folder_paths.get_input_directory()
+        ImageMetadataReader.files = sorted(
+            [
+                f
+                for f in os.listdir(input_dir)
+                if os.path.isfile(os.path.join(input_dir, f))
+            ]
+        )
+        return {
+            "required": {
+                "image": (ImageMetadataReader.files, {"image_upload": True}),
+            },
+            "optional": {
+                "parameter_index": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 255, "step": 1},
+                ),
+            },
+        }
+
+    RETURN_TYPES = (
+        "IMAGE",
+        "MASK",
+        "STRING",
+        "STRING",
+        "INT",
+        "INT",
+        "FLOAT",
+        "INT",
+        "INT",
+        "*",
+        "STRING",
+        "STRING",
+    )
+    RETURN_NAMES = (
+        "IMAGE",
+        "MASK",
+        "POSITIVE",
+        "NEGATIVE",
+        "SEED",
+        "STEPS",
+        "CFG",
+        "WIDTH",
+        "HEIGHT",
+        "MODEL_NAME",
+        "FILENAME",
+        "SETTINGS",
+    )
+
+    FUNCTION = "load_image"
+    CATEGORY = "SD Prompt Reader"
+    OUTPUT_NODE = True
+
+    def load_image(self, image, parameter_index):
+        if image in ImageMetadataReader.files:
+            image_path = folder_paths.get_annotated_filepath(image)
+        elif image.startswith("pasted/"):
+            image_path = folder_paths.get_annotated_filepath(image)
+        else:
+            image_path = image
+        i = Image.open(image_path)
+        i = ImageOps.exif_transpose(i)
+        image = i.convert("RGB")
+        image = np.array(image).astype(np.float32) / 255.0
+        image = torch.from_numpy(image)[None,]
+        if "A" in i.getbands():
+            mask = np.array(i.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask)
+        else:
+            mask = torch.zeros((64, 64), dtype=torch.float32, device="cpu")
+
+        file_path = Path(image_path)
+
+        with open(file_path, "rb") as f:
+            image_data = ImageDataReader(f)
+            if image_data.status.name == "COMFYUI_ERROR":
+                output_to_terminal(ERROR_MESSAGE["complex_workflow"])
+                return self.error_output(
+                    error_message=ERROR_MESSAGE["complex_workflow"],
+                    image=image,
+                    mask=mask,
+                    width=i.width,
+                    height=i.height,
+                    filename=file_path.stem,
+                )
+            elif image_data.status.name in ["FORMAT_ERROR", "UNREAD"]:
+                output_to_terminal(ERROR_MESSAGE["format_error"])
+                return self.error_output(
+                    error_message=ERROR_MESSAGE["format_error"],
+                    image=image,
+                    mask=mask,
+                    width=i.width,
+                    height=i.height,
+                    filename=file_path.stem,
+                )
+
+            seed = int(
+                self.param_parser(image_data.parameter.get("seed", 0), parameter_index)
+                or 0
+            )
+            steps = int(
+                self.param_parser(image_data.parameter.get("steps", 0), parameter_index)
+                or 0
+            )
+            cfg = float(
+                self.param_parser(image_data.parameter.get("cfg", 0), parameter_index)
+                or 0
+            )
+            model = str(
+                self.param_parser(
+                    image_data.parameter.get("model", ""), parameter_index
+                )
+                or ""
+            )
+            width = int(image_data.width or 0)
+            height = int(image_data.height or 0)
+
+            output_to_terminal("Positive: \n" + image_data.positive)
+            output_to_terminal("Negative: \n" + image_data.negative)
+            output_to_terminal("Setting: \n" + image_data.setting)
+
+            model = self.search_model(model)
+
+        return {
+            "ui": {
+                "text": (image_data.positive, image_data.negative, image_data.setting)
+            },
+            "result": (
+                image,
+                mask,
+                image_data.positive,
+                image_data.negative,
+                seed,
+                steps,
+                cfg,
+                width,
+                height,
+                model,
+                file_path.stem,
+                image_data.setting,
+            ),
+        }
+
+    @staticmethod
+    def param_parser(data: str, index: int):
+        try:
+            data_list = data.strip("()").split(",")
+        except AttributeError:
+            return None
+        else:
+            return data_list[0] if len(data_list) == 1 else data_list[index]
+
+    @staticmethod
+    def search_model(model: str):
+        if not model or model in ImageMetadataReader.ckpt_paths:
+            return model
+
+        model_path = Path(model)
+        model_name = model_path.name
+        model_stem = model_path.stem
+
+        if model_name in ImageMetadataReader.ckpt_names:
+            return ImageMetadataReader.ckpt_paths[
+                ImageMetadataReader.ckpt_names.index(model_name)
+            ]
+
+        if model_stem in ImageMetadataReader.ckpt_stems:
+            return ImageMetadataReader.ckpt_paths[
+                ImageMetadataReader.ckpt_stems.index(model_stem)
+            ]
+
+        return model
+
+    @staticmethod
+    def error_output(
+        error_message, image=None, mask=None, width=0, height=0, filename=""
+    ):
+        return {
+            "ui": {"text": ("", "", error_message)},
+            "result": (
+                image,
+                mask,
+                "",
+                "",
+                0,
+                0,
+                0.0,
+                width,
+                height,
+                "",
+                filename,
+                "",
+            ),
+        }
+
+    @classmethod
+    def IS_CHANGED(s, image, parameter_index):
+        if image in ImageMetadataReader.files:
+            image_path = folder_paths.get_annotated_filepath(image)
+        else:
+            image_path = image
+        with open(Path(image_path), "rb") as f:
+            image_data = ImageDataReader(f)
+        return image_data.props
+
+    @classmethod
+    def VALIDATE_INPUTS(s, image):
+        return True
+
+
+
+class SDParameterGenerator:
+    ASPECT_RATIO_MAP = {
+        "1:1": (512, 512),
+        "4:3": (576, 448),
+        "3:4": (448, 576),
+        "3:2": (608, 416),
+        "2:3": (416, 608),
+        "16:9": (672, 384),
+        "9:16": (384, 672),
+        "21:9": (768, 320),
+        "9:21": (320, 768),
+    }
+
+    MODEL_SCALING_FACTOR = {
+        "SDv1 512px": 1.0,
+        "SDv2 768px": 1.5,
+        "SDXL 1024px": 2.0,
+    }
+
+    DEFAULT_ASPECT_RATIO_DISPLAY = list(
+        map(
+            lambda x, scaling_factor=MODEL_SCALING_FACTOR: (
+                f"{x[0]} - "
+                f"{int(x[1][0]*scaling_factor['SDv1 512px'])}x"
+                f"{int(x[1][1]*scaling_factor['SDv1 512px'])} | "
+                f"{int(x[1][0]*scaling_factor['SDv2 768px'])}x"
+                f"{int(x[1][1]*scaling_factor['SDv2 768px'])} | "
+                f"{int(x[1][0]*scaling_factor['SDXL 1024px'])}x"
+                f"{int(x[1][1]*scaling_factor['SDXL 1024px'])}"
+            ),
+            ASPECT_RATIO_MAP.items(),
+        )
+    )
+
+    ckpt_list = []
+
+    @classmethod
+    def INPUT_TYPES(s):
+        SDParameterGenerator.ckpt_list = folder_paths.get_filename_list("checkpoints")
+        return {
+            "required": {
+                "ckpt_name": (SDParameterGenerator.ckpt_list,),
+            },
+            "optional": {
+                "vae_name": (
+                    ["baked VAE"] + folder_paths.get_filename_list("vae"),
+                    {"default": "baked VAE"},
+                ),
+                "model_version": (
+                    list(SDParameterGenerator.MODEL_SCALING_FACTOR.keys()),
+                    {"default": "SDv1 512px"},
+                ),
+                "config_name": (
+                    ["none"] + folder_paths.get_filename_list("configs"),
+                    {"default": "none"},
+                ),
+                "seed": (
+                    "INT",
+                    {"default": -1, "min": -3, "max": 0xFFFFFFFFFFFFFFFF},
+                ),
+                "steps": ("INT", {"default": 20, "min": 1, "max": 10000}),
+                "refiner_start": (
+                    "FLOAT",
+                    {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 8.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.5,
+                        "round": 0.01,
+                    },
+                ),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS,),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS,),
+                "positive_ascore": (
+                    "FLOAT",
+                    {"default": 6.0, "min": 0.0, "max": 1000.0, "step": 0.01},
+                ),
+                "negative_ascore": (
+                    "FLOAT",
+                    {"default": 6.0, "min": 0.0, "max": 1000.0, "step": 0.01},
+                ),
+                "aspect_ratio": (
+                    ["custom"] + SDParameterGenerator.DEFAULT_ASPECT_RATIO_DISPLAY,
+                    {"default": "custom"},
+                ),
+                "width": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": MAX_RESOLUTION, "step": 8},
+                ),
+                "height": (
+                    "INT",
+                    {"default": 512, "min": 16, "max": MAX_RESOLUTION, "step": 8},
+                ),
+                "batch_size": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 4096,
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = (
+        folder_paths.get_filename_list("checkpoints"),
+        folder_paths.get_filename_list("vae"),
+        "MODEL",
+        "CLIP",
+        "VAE",
+        "INT",
+        "INT",
+        "INT",
+        "FLOAT",
+        comfy.samplers.KSampler.SAMPLERS,
+        comfy.samplers.KSampler.SCHEDULERS,
+        "FLOAT",
+        "FLOAT",
+        "INT",
+        "INT",
+        "INT",
+        "STRING",
+    )
+
+    RETURN_NAMES = (
+        "MODEL_NAME",
+        "VAE_NAME",
+        "MODEL",
+        "CLIP",
+        "VAE",
+        "SEED",
+        "STEPS",
+        "REFINER_START_STEP",
+        "CFG",
+        "SAMPLER_NAME",
+        "SCHEDULER",
+        "POSITIVE_ASCORE",
+        "NEGATIVE_ASCORE",
+        "WIDTH",
+        "HEIGHT",
+        "BATCH_SIZE",
+        "PARAMETERS",
+    )
+    FUNCTION = "generate_parameter"
+
+    CATEGORY = "SD Prompt Reader"
+
+    def generate_parameter(
+        self,
+        ckpt_name,
+        vae_name,
+        model_version,
+        config_name,
+        seed,
+        steps,
+        refiner_start,
+        cfg,
+        sampler_name,
+        scheduler,
+        positive_ascore,
+        negative_ascore,
+        aspect_ratio,
+        width,
+        height,
+        batch_size,
+        output_vae=True,
+        output_clip=True,
+    ):
+        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+        if config_name != "none":
+            config_path = folder_paths.get_full_path("configs", config_name)
+            checkpoint = comfy.sd.load_checkpoint(
+                config_path,
+                ckpt_path,
+                output_vae=True,
+                output_clip=True,
+                embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            )
+        else:
+            checkpoint = comfy.sd.load_checkpoint_guess_config(
+                ckpt_path,
+                output_vae=True,
+                output_clip=True,
+                embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            )[:3]
+
+        if vae_name != "baked VAE":
+            vae_name_real = vae_name
+            vae_path = folder_paths.get_full_path("vae", vae_name)
+            sd = comfy.utils.load_torch_file(vae_path)
+            vae = comfy.sd.VAE(sd=sd)
+            checkpoint = (*checkpoint[:2], vae)
+            vae_str = f"VAE: {vae_name}, \n"
+        else:
+            vae_str = ""
+            vae_name_real = ""
+
+        if aspect_ratio != "custom":
+            aspect_ratio_value = aspect_ratio.split(" - ")[0]
+            width = int(
+                SDParameterGenerator.ASPECT_RATIO_MAP[aspect_ratio_value][0]
+                * SDParameterGenerator.MODEL_SCALING_FACTOR[model_version]
+            )
+            height = int(
+                SDParameterGenerator.ASPECT_RATIO_MAP[aspect_ratio_value][1]
+                * SDParameterGenerator.MODEL_SCALING_FACTOR[model_version]
+            )
+
+        base_steps = int(steps * refiner_start)
+        refiner_steps = steps - base_steps
+
+        if model_version == "SDXL 1024px":
+            ascore = (
+                f"Positive aesthetic score: {positive_ascore},\n"
+                f"Negative aesthetic score: {negative_ascore},\n"
+            )
+        else:
+            ascore = ""
+
+        parameters = (
+            f"Model: {ckpt_name},\n"
+            f"{vae_str}"
+            f"Seed: {str(seed)},\n"
+            f"Steps: {str(steps)},\n"
+            f"CFG scale: {str(cfg)},\n"
+            f"Sampler: {sampler_name},\n"
+            f"Scheduler: {scheduler},\n"
+            f"{ascore}"
+            f"Size: {str(width)}x{str(height)},\n"
+            f"Batch size: {str(batch_size)}\n"
+        )
+
+        return {
+            "ui": {
+                "text": (
+                    aspect_ratio.split(" - ")[0],
+                    model_version,
+                    width,
+                    height,
+                    steps,
+                    refiner_start,
+                    base_steps,
+                    refiner_steps,
+                    SDParameterGenerator.ASPECT_RATIO_MAP,
+                    SDParameterGenerator.MODEL_SCALING_FACTOR,
+                )
+            },
+            "result": (
+                (
+                    ckpt_name,
+                    vae_name_real,
+                )
+                + checkpoint
+                + (
+                    seed,
+                    steps,
+                    base_steps,
+                    cfg,
+                    sampler_name,
+                    scheduler,
+                    positive_ascore,
+                    negative_ascore,
+                    width,
+                    height,
+                    batch_size,
+                    parameters,
+                )
+            ),
+        }
+
+    @classmethod
+    def VALIDATE_INPUTS(s, aspect_ratio):
+        return True
+
+
+
+class SDTypeConverter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {},
+            "optional": {
+                "model_name": (
+                    folder_paths.get_filename_list("checkpoints"),
+                    {"forceInput": True},
+                ),
+                "sampler_name": (
+                    comfy.samplers.KSampler.SAMPLERS,
+                    {"forceInput": True},
+                ),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"forceInput": True}),
+            },
+        }
+
+    RETURN_TYPES = (
+        "STRING",
+        "STRING",
+        "STRING",
+    )
+
+    RETURN_NAMES = (
+        "MODEL_NAME_STR",
+        "SAMPLER_NAME_STR",
+        "SCHEDULER_STR",
+    )
+
+    FUNCTION = "convert_string"
+    CATEGORY = "SD Prompt Reader"
+
+    def convert_string(
+        self, model_name: str = "", sampler_name: str = "", scheduler: str = ""
+    ):
+        return (
+            model_name,
+            sampler_name,
+            scheduler,
+        )
 
