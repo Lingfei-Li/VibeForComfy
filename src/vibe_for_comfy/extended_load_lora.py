@@ -102,6 +102,6 @@ class ExtendedLoadLoRA:
         enhanced_prompt = "\n".join(prompt_parts) if prompt_parts else ""
         
         # Update lora list - work with list of strings
-        new_lora_entry = f"{lora_name}:{strength_model}"            
+        new_lora_entry = f"{lora_name}"            
         
         return (model_with_lora, enhanced_prompt, loaded_lora_names_list + [new_lora_entry])
