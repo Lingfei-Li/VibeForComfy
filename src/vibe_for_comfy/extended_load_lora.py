@@ -92,13 +92,23 @@ class ExtendedLoadLoRA:
         
         model_with_lora, _ = LoraLoader().load_lora(model, None, lora_name, strength_model, None)
         
-        # Build enhanced prompt
+        # Build enhanced prompt        
         prompt_parts = []
+        
+        # Start with existing prompt if provided
         if prompt:
             prompt_parts.append(prompt)
+        
+        # Add LoRA name and weight to prompt as a separate line
+        prompt_parts.append("\n")
+        lora_info = f"<lora:{lora_name}:{strength_model}>"
+        prompt_parts.append(lora_info)
+
+        # Add LoRA specific prompt if provided
         if prompt_to_append:
             prompt_parts.append(prompt_to_append)
         
+        prompt_parts.append("\n")
         enhanced_prompt = "\n".join(prompt_parts) if prompt_parts else ""
         
         # Update lora list - work with list of strings
